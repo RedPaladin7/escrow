@@ -1,6 +1,7 @@
 package game
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -21,19 +22,19 @@ const (
 )
 
 type Game struct {
-	lock              sync.RWMutex
-	listenAddr        string
-	broadcastFunc     BroadcastFunc
-	playerStates      map[string]*PlayerState
-	rotationMap       map[int]string
-	nextRotationID    int
-	currentDealerID   int
-	currentPlayerTurn int
-	currentStatus     GameStatus
-	currentPot        int
-	highestBet        int
-	lastRaiserID      int
-	lastRaiseAmount   int
+	lock          sync.RWMutex
+	listenAddr    string
+	broadcastFunc BroadcastFunc
+	playerStates  map[string]*PlayerState
+	rotationMap   map[int]string
+	nextRotationID     int
+	currentDealerID    int
+	currentPlayerTurn  int
+	currentStatus      GameStatus
+	currentPot         int
+	highestBet         int
+	lastRaiserID       int
+	lastRaiseAmount    int
 
 	// Deck and cards
 	deckKeys         *crypto.CardKeys
@@ -50,6 +51,9 @@ type Game struct {
 	blockchain        *blockchain.BlockchainClient
 	blockchainGameID  [32]byte
 	blockchainEnabled bool
+
+	// NEW: Disconnect handling
+	DisconnectHandler *DisconnectHandler
 }
 
 type BroadcastFunc func(data []byte, targets ...string)
@@ -62,22 +66,24 @@ type SidePot struct {
 
 func NewGame(addr string, broadcast BroadcastFunc, bc *blockchain.BlockchainClient) *Game {
 	keys, _ := crypto.GenerateCardKeys()
-
 	g := &Game{
-		listenAddr:        addr,
-		broadcastFunc:     broadcast,
-		playerStates:      make(map[string]*PlayerState),
-		rotationMap:       make(map[int]string),
-		currentStatus:     GameStatusWaiting,
-		deckKeys:          keys,
-		foldedPlayerKeys:  make(map[string]*crypto.CardKeys),
-		revealedKeys:      make(map[string]*crypto.CardKeys),
-		myHand:            make([]deck.Card, 0, 2),
-		communityCards:    make([]deck.Card, 0, 5),
-		sidePots:          []SidePot{},
-		blockchain:        bc,
+		listenAddr:       addr,
+		broadcastFunc:    broadcast,
+		playerStates:     make(map[string]*PlayerState),
+		rotationMap:      make(map[int]string),
+		currentStatus:    GameStatusWaiting,
+		deckKeys:         keys,
+		foldedPlayerKeys: make(map[string]*crypto.CardKeys),
+		revealedKeys:     make(map[string]*crypto.CardKeys),
+		myHand:           make([]deck.Card, 0, 2),
+		communityCards:   make([]deck.Card, 0, 5),
+		sidePots:         []SidePot{},
+		blockchain:       bc,
 		blockchainEnabled: bc != nil,
 	}
+
+	// NEW: Initialize disconnect handler
+	g.DisconnectHandler = NewDisconnectHandler(g)
 
 	go g.loop()
 	return g
@@ -111,7 +117,6 @@ func (g *Game) PlayerCount() int {
 func (g *Game) ActivePlayerCount() int {
 	g.lock.RLock()
 	defer g.lock.RUnlock()
-
 	count := 0
 	for _, state := range g.playerStates {
 		if state.IsActive {
@@ -127,12 +132,12 @@ func (g *Game) GetAllPlayers() []PlayerStateResponse {
 	defer g.lock.RUnlock()
 
 	players := make([]PlayerStateResponse, 0)
-
 	for i := 0; i < g.nextRotationID; i++ {
 		addr, ok := g.rotationMap[i]
 		if !ok {
 			continue
 		}
+
 		state, ok := g.playerStates[addr]
 		if !ok {
 			continue
@@ -151,7 +156,6 @@ func (g *Game) GetAllPlayers() []PlayerStateResponse {
 			IsCurrentTurn: state.RotationID == g.currentPlayerTurn,
 		})
 	}
-
 	return players
 }
 
@@ -200,20 +204,20 @@ func (g *Game) GetTableState(clientID string) TableStateResponse {
 	}
 
 	return TableStateResponse{
-		Status:         g.currentStatus.String(),
-		MyHand:         myHandResp,
-		CommunityCards: communityCardResp,
-		Pot:            g.currentPot,
-		HighestBet:     g.highestBet,
-		MinRaise:       minRaise,
-		ValidActions:   actionStrings,
-		IsMyTurn:       myState.RotationID == g.currentPlayerTurn,
-		MyStack:        myState.Stack,
-		CurrentTurnID:  g.currentPlayerTurn,
-		MyPlayerID:     myState.RotationID,
-		DealerID:       g.currentDealerID,
-		SmallBlind:     SmallBlind,
-		BigBlind:       BigBlind,
+		Status:          g.currentStatus.String(),
+		MyHand:          myHandResp,
+		CommunityCards:  communityCardResp,
+		Pot:             g.currentPot,
+		HighestBet:      g.highestBet,
+		MinRaise:        minRaise,
+		ValidActions:    actionStrings,
+		IsMyTurn:        myState.RotationID == g.currentPlayerTurn,
+		MyStack:         myState.Stack,
+		CurrentTurnID:   g.currentPlayerTurn,
+		MyPlayerID:      myState.RotationID,
+		DealerID:        g.currentDealerID,
+		SmallBlind:      SmallBlind,
+		BigBlind:        BigBlind,
 	}
 }
 
@@ -251,7 +255,6 @@ func (g *Game) handleMessagePlayerAction(from string, payload protocol.PlayerAct
 		"action": payload.Action,
 		"value":  payload.Value,
 	}).Info("Received player action")
-
 	return g.HandlePlayerAction(from, payload.Action, payload.Value)
 }
 
@@ -374,7 +377,6 @@ func (g *Game) StartNewHand() {
 		buyIn := big.NewInt(int64(1000)) // Default 1000 wei buy-in
 		smallBlind := big.NewInt(int64(SmallBlind))
 		bigBlind := big.NewInt(int64(BigBlind))
-
 		gameID, err := g.blockchain.CreateGame(buyIn, smallBlind, bigBlind, uint8(len(activeReadyPlayers)))
 		if err != nil {
 			logrus.Errorf("Failed to create game on blockchain: %v", err)
@@ -396,7 +398,6 @@ func (g *Game) StartNewHand() {
 				allVerified = false
 			}
 		}
-
 		if !allVerified {
 			logrus.Warn("Not all players have verified buy-ins, but continuing game...")
 			// In production, you might want to reject game start here
@@ -456,7 +457,6 @@ func (g *Game) StartNewHand() {
 // Post blinds
 func (g *Game) postBlinds() {
 	activeCount := len(g.getReadyActivePlayers())
-
 	if activeCount == 2 {
 		// Heads-up: dealer posts small blind
 		sbID := g.currentDealerID
@@ -534,4 +534,111 @@ func (g *Game) updatePlayerState(addr string, action PlayerAction, value int) {
 	case PlayerActionCheck:
 		// No state change
 	}
+}
+
+// NEW: MonitorPlayerConnection monitors a player's connection
+func (g *Game) MonitorPlayerConnection(playerID string) {
+	g.lock.Lock()
+	defer g.lock.Unlock()
+
+	logrus.Warnf("⚠️  Monitoring disconnect for player %s", playerID)
+
+	// Check if player exists
+	state, exists := g.playerStates[playerID]
+	if !exists {
+		logrus.Warnf("Player %s not found in game", playerID)
+		return
+	}
+
+	// Only handle disconnect if game is active
+	if g.currentStatus != GameStatusInProgress && g.currentStatus != GameStatusDealing {
+		logrus.Infof("Game not active, ignoring disconnect for %s", playerID)
+		return
+	}
+
+	// Mark player as potentially disconnected
+	state.IsActive = false
+
+	// Run disconnect handler in goroutine
+	go func() {
+		ctx := context.Background()
+		if err := g.DisconnectHandler.HandleDisconnect(ctx, playerID); err != nil {
+			logrus.Errorf("Error handling disconnect for player %s: %v", playerID, err)
+		}
+	}()
+}
+
+// NEW: NotifyPlayerReconnected notifies that a player reconnected
+func (g *Game) NotifyPlayerReconnected(playerID string) error {
+	g.lock.Lock()
+	defer g.lock.Unlock()
+
+	logrus.Infof("✅ Player %s reconnected", playerID)
+
+	// Restore player to active state
+	state, exists := g.playerStates[playerID]
+	if exists {
+		state.IsActive = true
+	}
+
+	return g.DisconnectHandler.HandleReconnect(playerID)
+}
+
+// NEW: GetPlayer returns a player state by address
+func (g *Game) GetPlayer(playerID string) *PlayerState {
+	g.lock.RLock()
+	defer g.lock.RUnlock()
+	return g.playerStates[playerID]
+}
+
+// NEW: EndGameWithPenalty ends game with penalty to abandoned player
+func (g *Game) EndGameWithPenalty(abandonedPlayerID string, remainingPlayers []*PlayerState) error {
+	logrus.Warnf("💀 Ending game with penalty. Abandoned player: %s", abandonedPlayerID)
+
+	abandonedPlayer := g.GetPlayer(abandonedPlayerID)
+	if abandonedPlayer == nil {
+		return fmt.Errorf("abandoned player %s not found", abandonedPlayerID)
+	}
+
+	// Prepare data for blockchain
+	winners := make([]common.Address, 0)
+	amounts := make([]*big.Int, 0)
+
+	for _, player := range remainingPlayers {
+		if player.Stack > 0 {
+			// Convert player address string to common.Address
+			winners = append(winners, common.HexToAddress(player.ListenAddr))
+			
+			// Convert chips to wei (assuming 1 chip = 0.001 ETH = 10^15 wei)
+			amountWei := big.NewInt(int64(player.Stack))
+			amountWei.Mul(amountWei, big.NewInt(1000000000000000)) // multiply by 10^15 wei
+			amounts = append(amounts, amountWei)
+		}
+	}
+
+	// Submit to blockchain if enabled
+	if g.blockchainEnabled && g.blockchain != nil {
+		logrus.Info("📝 Submitting penalty transaction to blockchain...")
+
+		gameIDStr := fmt.Sprintf("%x", g.blockchainGameID[:])
+		
+		err := g.blockchain.EndGameWithPenalty(
+			gameIDStr,
+			common.HexToAddress(abandonedPlayer.ListenAddr),
+			winners,
+			amounts,
+		)
+
+		if err != nil {
+			logrus.Errorf("Blockchain penalty submission failed: %v", err)
+			return fmt.Errorf("blockchain penalty submission failed: %w", err)
+		}
+
+		logrus.Info("✅ Blockchain penalty transaction successful")
+	}
+
+	// Update game status
+	g.setStatus(GameStatusFinished)
+
+	return nil
 }
