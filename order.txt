@@ -1,0 +1,64 @@
+═══════════════════════════════════════════════════════════════════
+COMPLETE FILE READING ORDER - ALL 55 FILES
+═══════════════════════════════════════════════════════════════════
+
+RANK 1  → internal/deck/card.go
+RANK 2  → internal/game/status.go
+RANK 3  → internal/protocol/constants.go
+RANK 4  → internal/api/response.go
+RANK 5  → internal/deck/deck.go
+RANK 6  → internal/deck/evaluator.go
+RANK 7  → internal/blockchain/utils.go
+RANK 8  → internal/config/config.go
+RANK 9  → internal/crypto/card_keys.go
+RANK 10 → internal/crypto/shuffle.go
+RANK 11 → internal/crypto/mental_poker.go ⭐
+RANK 12 → internal/game/player.go
+RANK 13 → internal/game/actions.go
+RANK 14 → internal/game/pot.go
+RANK 15 → internal/game/betting.go ⭐
+RANK 16 → internal/game/game.go ⭐⭐⭐ CRITICAL
+RANK 17 → internal/game/showdown.go ⭐
+RANK 18 → internal/protocol/message.go
+RANK 19 → internal/protocol/events.go
+RANK 20 → internal/protocol/validation.go
+RANK 21 → internal/protocol/broadcast.go
+RANK 22 → internal/transport/websocket.go
+RANK 23 → internal/transport/peer.go
+RANK 24 → internal/server/client.go
+RANK 25 → internal/server/websocket_hub.go ⭐
+RANK 26 → internal/server/peer_manager.go
+RANK 27 → internal/server/server.go ⭐⭐⭐ CRITICAL
+RANK 28 → internal/api/middleware.go
+RANK 29 → internal/api/handlers.go
+RANK 30 → internal/api/routes.go
+RANK 31 → internal/persistence/snapshot.go
+RANK 32 → internal/persistence/backup.go
+RANK 33 → internal/persistence/recovery.go
+RANK 34 → internal/blockchain/wallet.go
+RANK 35 → internal/blockchain/transactions.go
+RANK 36 → internal/blockchain/verification.go
+RANK 37 → internal/blockchain/events.go ⭐
+RANK 38 → internal/blockchain/contracts.go
+RANK 39 → internal/blockchain/client.go ⭐⭐
+RANK 40 → contracts/interfaces/IPokerTable.sol
+RANK 41 → contracts/PlayerRegistry.sol
+RANK 42 → contracts/PotManager.sol
+RANK 43 → contracts/DisputeResolver.sol
+RANK 44 → contracts/PokerTable.sol ⭐⭐
+RANK 45 → scripts/deploy.js
+RANK 46 → hardhat.config.js
+RANK 47 → Makefile
+RANK 48 → setup.sh
+RANK 49 → cmd/server/main.go ⭐⭐⭐ CRITICAL
+RANK 50 → .env.example
+RANK 51 → .gitignore
+RANK 52 → go.mod
+RANK 53 → package.json
+RANK 54 → README.md
+RANK 55 → test/PokerTable.test.js
+
+═══════════════════════════════════════════════════════════════════
+🚀 FASTEST PATH (Only 7 files):
+═══════════════════════════════════════════════════════════════════
+RANK 1, 2, 5, 12, 16, 27, 49
