@@ -2,165 +2,238 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/RedPaladin7/peerpoker/internal/api"
+	"github.com/RedPaladin7/peerpoker/internal/blockchain"
 	"github.com/RedPaladin7/peerpoker/internal/config"
 	"github.com/RedPaladin7/peerpoker/internal/game"
+	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 )
 
 type Server struct {
+	listenAddr  string
+	apiPort     string
 	config      *config.Config
 	hub         *WebSocketHub
 	peerManager *PeerManager
 	game        *game.Game
-	apiServer   *http.Server
-	wsServer    *http.Server
-	wg          sync.WaitGroup
+	blockchain  *blockchain.BlockchainClient
+	mu          sync.RWMutex
+	running     bool
 }
 
-func NewServer(cfg *config.Config) (*Server, error) {
-	hub := NewWebSocketHub()
-	peerManager := NewPeerManager(cfg.MaxPlayers)
-	
-	gameInstance := game.NewGame(cfg.WSPort, hub.Broadcast)
+func NewServer(cfg *config.Config) *Server {
+	// Initialize blockchain client if enabled
+	var bc *blockchain.BlockchainClient
+	if os.Getenv("BLOCKCHAIN_ENABLED") == "true" {
+		logrus.Info("Blockchain integration enabled, initializing client...")
+
+		bcConfig := &blockchain.Config{
+			RPCURL:                 os.Getenv("BLOCKCHAIN_RPC_URL"),
+			PrivateKey:             os.Getenv("BLOCKCHAIN_PRIVATE_KEY"),
+			PokerTableAddress:      os.Getenv("CONTRACT_POKER_TABLE"),
+			PotManagerAddress:      os.Getenv("CONTRACT_POT_MANAGER"),
+			PlayerRegistryAddress:  os.Getenv("CONTRACT_PLAYER_REGISTRY"),
+			DisputeResolverAddress: os.Getenv("CONTRACT_DISPUTE_RESOLVER"),
+		}
+
+		var err error
+		bc, err = blockchain.NewBlockchainClient(bcConfig)
+		if err != nil {
+			logrus.Warnf("Failed to initialize blockchain client: %v", err)
+			logrus.Warn("Continuing without blockchain integration")
+			bc = nil
+		} else {
+			logrus.Info("✅ Blockchain client initialized successfully")
+
+			// Log blockchain info
+			balance, err := bc.GetMyBalance()
+			if err == nil {
+				logrus.WithField("balance", blockchain.ConvertFromWei(balance)).Info("Wallet balance")
+			}
+		}
+	} else {
+		logrus.Info("Blockchain integration disabled")
+	}
 
 	s := &Server{
-		config:      cfg,
-		hub:         hub,
-		peerManager: peerManager,
-		game:        gameInstance,
+		listenAddr: cfg.ListenAddr,
+		apiPort:    cfg.APIPort,
+		config:     cfg,
+		blockchain: bc,
 	}
 
-	apiHandler := api.NewHandler(s.game, s.peerManager, s.hub)
-	
-	s.apiServer = &http.Server{
-		Addr:    cfg.GetAPIAddr(),
-		Handler: apiHandler.Routes(),
-	}
+	s.hub = NewWebSocketHub(s)
+	s.peerManager = NewPeerManager(s)
 
-	wsHandler := s.createWSHandler()
-	s.wsServer = &http.Server{
-		Addr:    cfg.GetWSAddr(),
-		Handler: wsHandler,
-	}
+	// Pass blockchain client to game
+	s.game = game.NewGame(cfg.ListenAddr, s.broadcastToPlayers, bc)
 
-	return s, nil
+	return s
 }
 
-func (s *Server) Start(ctx context.Context) error {
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.hub.Run(ctx)
-	}()
-
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		logrus.Infof("API server listening on %s", s.apiServer.Addr)
-		if err := s.apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logrus.Errorf("API server error: %v", err)
-		}
-	}()
-
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		logrus.Infof("WebSocket server listening on %s", s.wsServer.Addr)
-		if err := s.wsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logrus.Errorf("WebSocket server error: %v", err)
-		}
-	}()
-
-	if s.config.InitialPeer != "" {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			if err := s.peerManager.ConnectToPeer(s.config.InitialPeer, s.hub); err != nil {
-				logrus.Errorf("Failed to connect to initial peer: %v", err)
-			}
-		}()
+func (s *Server) Start() error {
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return fmt.Errorf("server already running")
 	}
+	s.running = true
+	s.mu.Unlock()
 
-	<-ctx.Done()
-	return nil
+	logrus.WithFields(logrus.Fields{
+		"ws_addr":  s.listenAddr,
+		"api_port": s.apiPort,
+	}).Info("Starting poker server")
+
+	// Start WebSocket hub
+	go s.hub.Run()
+
+	// Start peer manager
+	go s.peerManager.Run()
+
+	// Start WebSocket server
+	go s.startWebSocketServer()
+
+	// Start HTTP API server
+	return s.startAPIServer()
 }
 
-func (s *Server) Shutdown(ctx context.Context) error {
-	logrus.Info("Shutting down servers...")
+func (s *Server) startWebSocketServer() {
+	router := mux.NewRouter()
 
-	errChan := make(chan error, 2)
-	
-	go func() {
-		errChan <- s.apiServer.Shutdown(ctx)
-	}()
-	
-	go func() {
-		errChan <- s.wsServer.Shutdown(ctx)
-	}()
+	// WebSocket endpoint for clients
+	router.HandleFunc("/ws", s.handleWebSocket)
 
-	var lastErr error
-	for i := 0; i < 2; i++ {
-		if err := <-errChan; err != nil {
-			logrus.Errorf("Shutdown error: %v", err)
-			lastErr = err
-		}
+	// WebSocket endpoint for peers
+	router.HandleFunc("/p2p", s.handlePeerConnection)
+
+	addr := s.listenAddr
+	logrus.Infof("WebSocket server listening on %s", addr)
+
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      router,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
-	s.hub.Close()
-	s.wg.Wait()
-
-	return lastErr
+	if err := server.ListenAndServe(); err != nil {
+		logrus.Fatalf("WebSocket server failed: %v", err)
+	}
 }
 
-func (s *Server) createWSHandler() http.Handler {
-	mux := http.NewServeMux()
-	
-	mux.HandleFunc("/ws", s.handleWebSocket)
-	mux.HandleFunc("/p2p", s.handleP2PConnection)
-	
-	return api.CORSMiddleware(mux)
+func (s *Server) startAPIServer() error {
+	router := mux.NewRouter()
+
+	// Create API handler
+	apiHandler := api.NewHandler(s.game)
+
+	// Setup routes
+	api.SetupRoutes(router, apiHandler)
+
+	// Add middleware
+	router.Use(api.LoggingMiddleware)
+	router.Use(api.CORSMiddleware)
+
+	addr := fmt.Sprintf(":%s", s.apiPort)
+	logrus.Infof("HTTP API server listening on %s", addr)
+
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      router,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	return server.ListenAndServe()
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	client, err := NewClientFromHTTP(w, r, s.hub, s.game, false)
+	client, err := NewClient(s.hub, w, r)
 	if err != nil {
-		logrus.Errorf("WebSocket upgrade failed: %v", err)
-		http.Error(w, "WebSocket upgrade failed", http.StatusBadRequest)
+		logrus.Errorf("Failed to create client: %v", err)
 		return
 	}
 
-	s.hub.Register <- client
-	
+	s.hub.register <- client
+
 	go client.WritePump()
 	go client.ReadPump()
 }
 
-func (s *Server) handleP2PConnection(w http.ResponseWriter, r *http.Request) {
-	if s.peerManager.PeerCount() >= s.config.MaxPlayers {
-		http.Error(w, "Maximum peers reached", http.StatusServiceUnavailable)
-		return
-	}
-
-	client, err := NewClientFromHTTP(w, r, s.hub, s.game, true)
+func (s *Server) handlePeerConnection(w http.ResponseWriter, r *http.Request) {
+	peer, err := s.peerManager.HandleIncomingPeer(w, r)
 	if err != nil {
-		logrus.Errorf("P2P WebSocket upgrade failed: %v", err)
-		http.Error(w, "WebSocket upgrade failed", http.StatusBadRequest)
+		logrus.Errorf("Failed to handle peer connection: %v", err)
 		return
 	}
 
-	if err := s.peerManager.AddPeer(client); err != nil {
-		logrus.Errorf("Failed to add peer: %v", err)
-		client.Close()
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	go peer.ReadPump()
+	go peer.WritePump()
+}
+
+func (s *Server) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.running {
 		return
 	}
 
-	s.hub.Register <- client
-	
-	go client.WritePump()
-	go client.ReadPump()
+	logrus.Info("Stopping server...")
+
+	// Close blockchain client
+	if s.blockchain != nil {
+		logrus.Info("Closing blockchain client...")
+		s.blockchain.Close()
+		logrus.Info("Blockchain client closed")
+	}
+
+	s.running = false
+	logrus.Info("Server stopped")
+}
+
+func (s *Server) ConnectToPeer(peerAddr string) error {
+	return s.peerManager.ConnectToPeer(peerAddr)
+}
+
+func (s *Server) broadcastToPlayers(data []byte, targets ...string) {
+	if len(targets) == 0 {
+		// Broadcast to all clients
+		s.hub.broadcast <- data
+	} else {
+		// Send to specific targets
+		for _, target := range targets {
+			s.hub.sendToClient(target, data)
+		}
+	}
+}
+
+func (s *Server) GetGame() *game.Game {
+	return s.game
+}
+
+func (s *Server) GetPeerManager() *PeerManager {
+	return s.peerManager
+}
+
+func (s *Server) GetHub() *WebSocketHub {
+	return s.hub
+}
+
+// GetBlockchainClient returns the blockchain client (can be nil)
+func (s *Server) GetBlockchainClient() *blockchain.BlockchainClient {
+	return s.blockchain
+}
+
+// IsBlockchainEnabled returns whether blockchain integration is active
+func (s *Server) IsBlockchainEnabled() bool {
+	return s.blockchain != nil
 }
