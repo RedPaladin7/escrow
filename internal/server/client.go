@@ -61,11 +61,20 @@ func NewClientFromHTTP(w http.ResponseWriter, r *http.Request, hub *WebSocketHub
 
 func (c *Client) ReadPump() {
 	defer func() {
+		logrus.Warnf("⚠️  Client %s connection closed", c.ID)
+
+		// NEW: Notify game of disconnect BEFORE unregistering
+		if c.game != nil {
+			logrus.Warnf("Notifying game of player %s disconnect", c.ID)
+			c.game.MonitorPlayerConnection(c.ID)
+		}
+
+		// Existing cleanup
 		c.hub.unregister <- c
 		c.conn.Close()
-		
-		// Remove from game
-		c.game.RemovePlayer(c.ID)
+
+		// NOTE: Don't remove player here - let disconnect handler manage it
+		// c.game.RemovePlayer(c.ID)  // REMOVED
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
@@ -110,6 +119,7 @@ func (c *Client) WritePump() {
 			if err != nil {
 				return
 			}
+
 			w.Write(message)
 
 			// Add queued messages to current websocket message
@@ -145,6 +155,32 @@ func (c *Client) handleMessage(data []byte) error {
 	}).Debug("Received message")
 
 	return c.game.HandleMessage(c.ID, &msg)
+}
+
+// NEW: HandleReconnect handles a player reconnection
+func (c *Client) HandleReconnect() error {
+	if c.game != nil {
+		logrus.Infof("✅ Player %s reconnected, notifying game", c.ID)
+		return c.game.NotifyPlayerReconnected(c.ID)
+	}
+	return nil
+}
+
+// NEW: IsConnected checks if client connection is still alive
+func (c *Client) IsConnected() bool {
+	if c.conn == nil {
+		return false
+	}
+
+	// Try to set a deadline - if it fails, connection is closed
+	err := c.conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+	if err != nil {
+		return false
+	}
+
+	// Reset the deadline
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	return true
 }
 
 func (c *Client) Send(data []byte) error {
