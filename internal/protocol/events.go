@@ -20,6 +20,13 @@ const (
 	EventError           EventType = "error"
 	EventTurnChange      EventType = "turn_change"
 	EventBlindsPosted    EventType = "blinds_posted"
+
+	// NEW: Disconnect and penalty events
+	EventPlayerDisconnected EventType = "player_disconnected"
+	EventPlayerReconnected  EventType = "player_reconnected"
+	EventPlayerAbandoned    EventType = "player_abandoned"
+	EventGameAborted        EventType = "game_aborted"
+	EventPenaltyApplied     EventType = "penalty_applied"
 )
 
 // Event represents a real-time event sent to clients
@@ -129,6 +136,48 @@ type BlindsPostedEvent struct {
 	BigBlindAmount   int    `json:"big_blind_amount"`
 }
 
+// NEW: PlayerDisconnectedEvent notifies when a player disconnects
+type PlayerDisconnectedEvent struct {
+	PlayerID  string `json:"player_id"`
+	Timestamp string `json:"timestamp"`
+	Timeout   string `json:"timeout"` // e.g., "5m0s"
+	Message   string `json:"message"`
+}
+
+// NEW: PlayerReconnectedEvent notifies when a player reconnects
+type PlayerReconnectedEvent struct {
+	PlayerID       string `json:"player_id"`
+	Timestamp      string `json:"timestamp"`
+	TimeDisconnect string `json:"time_disconnected"` // Duration they were disconnected
+	Message        string `json:"message"`
+}
+
+// NEW: PlayerAbandonedEvent notifies when a player abandons (timeout)
+type PlayerAbandonedEvent struct {
+	PlayerID      string `json:"player_id"`
+	Timestamp     string `json:"timestamp"`
+	PenaltyAmount int    `json:"penalty_amount"` // Amount forfeited
+	Message       string `json:"message"`
+}
+
+// NEW: GameAbortedEvent notifies when game is aborted due to disconnect
+type GameAbortedEvent struct {
+	GameID           string   `json:"game_id"`
+	AbandonedPlayer  string   `json:"abandoned_player"`
+	RemainingPlayers []string `json:"remaining_players"`
+	Timestamp        string   `json:"timestamp"`
+	Reason           string   `json:"reason"`
+}
+
+// NEW: PenaltyDistributionEvent notifies of penalty distribution
+type PenaltyDistributionEvent struct {
+	AbandonedPlayer string         `json:"abandoned_player"`
+	PenaltyAmount   int            `json:"penalty_amount"`
+	Distribution    map[string]int `json:"distribution"` // playerID -> amount received
+	Timestamp       string         `json:"timestamp"`
+	Message         string         `json:"message"`
+}
+
 // CardData represents a card in events
 type CardData struct {
 	Suit    string `json:"suit"`
@@ -158,10 +207,10 @@ type ShowdownPlayerResult struct {
 
 // WinnerData represents a winner's information
 type WinnerData struct {
-	PlayerID  string `json:"player_id"`
-	Amount    int    `json:"amount"`
-	HandName  string `json:"hand_name,omitempty"`
-	NewStack  int    `json:"new_stack"`
+	PlayerID string `json:"player_id"`
+	Amount   int    `json:"amount"`
+	HandName string `json:"hand_name,omitempty"`
+	NewStack int    `json:"new_stack"`
 }
 
 // ErrorEvent represents an error event
