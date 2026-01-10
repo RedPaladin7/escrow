@@ -140,56 +140,63 @@ func (g *Game) advanceToNextRound() {
 	}
 }
 
-// resetHandState resets the game state for a new hand
-func (g *Game) resetHandState() {
-	logrus.Info("=== Resetting for new hand ===")
-
-	g.currentPot = 0
-	g.highestBet = 0
-	g.lastRaiseAmount = BigBlind
-	g.myHand = make([]deck.Card, 0, 2)
-	g.communityCards = make([]deck.Card, 0, 5)
-	g.currentDeck = nil
-	g.sidePots = []SidePot{}
-	g.revealedKeys = make(map[string]*crypto.CardKeys)
-	g.foldedPlayerKeys = make(map[string]*crypto.CardKeys)
-
-	// Remove players with no chips
-	for addr, state := range g.playerStates {
-		if state.Stack <= 0 {
-			state.IsActive = false
-			logrus.Infof("Player %s eliminated (no chips)", addr)
-		}
-	}
-
-	// Check if we have enough players
-	if len(g.getReadyActivePlayers()) >= 2 {
-		g.setStatus(GameStatusWaiting)
-		// Auto-start next hand after a delay if all players are still ready
-		// For now, we'll wait for ready signals again
-	} else {
-		g.setStatus(GameStatusWaiting)
-		logrus.Info("Not enough players, waiting for more")
-	}
-}
-
 // dealFlop deals the flop (3 community cards)
 func (g *Game) dealFlop() {
-	logrus.Info("Dealing flop...")
-	// TODO: Implement actual card dealing from encrypted deck
+	logrus.Info("Dealing flop (3 cards)...")
+	g.dealCommunityCards(3)
+	
+	logrus.Infof("Flop: %v", g.communityCards)
+	
+	// Reset turn to first active player after dealer
 	g.currentPlayerTurn = g.getNextActivePlayerID(g.currentDealerID)
+	
+	// Broadcast flop to all players
+	g.broadcastCommunityCards("flop")
 }
 
 // dealTurn deals the turn (4th community card)
 func (g *Game) dealTurn() {
-	logrus.Info("Dealing turn...")
-	// TODO: Implement actual card dealing from encrypted deck
+	logrus.Info("Dealing turn (1 card)...")
+	g.dealCommunityCards(1)
+	
+	logrus.Infof("Turn: %s", g.communityCards[3].String())
+	
+	// Reset turn to first active player after dealer
 	g.currentPlayerTurn = g.getNextActivePlayerID(g.currentDealerID)
+	
+	// Broadcast turn to all players
+	g.broadcastCommunityCards("turn")
 }
 
 // dealRiver deals the river (5th community card)
 func (g *Game) dealRiver() {
-	logrus.Info("Dealing river...")
-	// TODO: Implement actual card dealing from encrypted deck
+	logrus.Info("Dealing river (1 card)...")
+	g.dealCommunityCards(1)
+	
+	logrus.Infof("River: %s", g.communityCards[4].String())
+	
+	// Reset turn to first active player after dealer
 	g.currentPlayerTurn = g.getNextActivePlayerID(g.currentDealerID)
+	
+	// Broadcast river to all players
+	g.broadcastCommunityCards("river")
+}
+
+// broadcastCommunityCards broadcasts community cards to all players
+func (g *Game) broadcastCommunityCards(stage string) {
+	cards := make([]CardResponse, len(g.communityCards))
+	for i, card := range g.communityCards {
+		cards[i] = CardResponse{
+			Suit:    card.Suit.String(),
+			Value:   card.Value,
+			Display: card.String(),
+		}
+	}
+
+	// Send to all players via protocol
+	// This will be picked up by the frontend
+	logrus.WithFields(logrus.Fields{
+		"stage": stage,
+		"cards": len(cards),
+	}).Info("Broadcasting community cards")
 }
