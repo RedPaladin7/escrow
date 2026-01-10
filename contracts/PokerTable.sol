@@ -17,6 +17,16 @@ contract PokerTable {
     event GameEnded(bytes32 indexed gameId, address[] winners, uint256[] payouts);
     event FundsLocked(bytes32 indexed gameId, address indexed player, uint256 amount);
     event FundsReleased(bytes32 indexed gameId, address indexed player, uint256 amount);
+    
+    // NEW: Disconnect penalty event
+    event GameEndedWithPenalty(
+        bytes32 indexed gameId,
+        address indexed abandonedPlayer,
+        address[] winners,
+        uint256[] payouts,
+        uint256 penaltyAmount,
+        uint256 timestamp
+    );
 
     // Structs
     struct Game {
@@ -214,6 +224,74 @@ contract PokerTable {
         }
 
         emit GameEnded(_gameId, _winners, _amounts);
+    }
+
+    /**
+     * @dev End game with penalty when a player abandons (NEW FUNCTION)
+     * Abandoned player loses their buy-in, which is distributed to remaining players
+     * @param _gameId The game identifier
+     * @param _abandonedPlayer Address of player who abandoned the game
+     * @param _winners Array of remaining player addresses
+     * @param _amounts Array of payout amounts (their original buy-in + share of penalty)
+     */
+    function endGameWithPenalty(
+        bytes32 _gameId,
+        address _abandonedPlayer,
+        address[] calldata _winners,
+        uint256[] calldata _amounts
+    ) external onlyGameCreator(_gameId) gameExists(_gameId) gameInStatus(_gameId, GameStatus.Active) {
+        Game storage game = games[_gameId];
+        
+        require(_winners.length == _amounts.length, "Mismatched arrays");
+        require(_winners.length > 0, "No winners");
+        require(game.hasJoined[_abandonedPlayer], "Not a valid player");
+
+        // Calculate penalty (abandoned player's buy-in)
+        uint256 penaltyAmount = game.playerBalances[_abandonedPlayer];
+        require(penaltyAmount > 0, "Abandoned player has no balance");
+
+        // Verify total payout
+        uint256 totalPayout = 0;
+        for (uint256 i = 0; i < _amounts.length; i++) {
+            totalPayout += _amounts[i];
+        }
+
+        // Calculate platform fee
+        uint256 platformFee = (game.totalPot * PLATFORM_FEE_PERCENT) / 100;
+        uint256 availablePot = game.totalPot - platformFee;
+
+        require(totalPayout <= availablePot, "Payout exceeds available pot");
+
+        // Verify all winners are valid players in the game
+        for (uint256 i = 0; i < _winners.length; i++) {
+            require(game.hasJoined[_winners[i]], "Winner not in game");
+            require(_winners[i] != _abandonedPlayer, "Abandoned player cannot be a winner");
+        }
+
+        // Mark abandoned player's balance as forfeited
+        game.playerBalances[_abandonedPlayer] = 0;
+
+        // Update game status
+        game.status = GameStatus.Ended;
+        game.endedAt = block.timestamp;
+
+        // Distribute winnings through PotManager
+        potManager.distributePot(_gameId, _winners, _amounts);
+
+        // Transfer platform fee
+        if (platformFee > 0) {
+            payable(platformFeeAddress).transfer(platformFee);
+        }
+
+        // Emit penalty event
+        emit GameEndedWithPenalty(
+            _gameId,
+            _abandonedPlayer,
+            _winners,
+            _amounts,
+            penaltyAmount,
+            block.timestamp
+        );
     }
 
     /**
