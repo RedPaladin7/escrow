@@ -5,6 +5,7 @@ import (
 	"math/big"
 
 	"github.com/RedPaladin7/peerpoker/internal/blockchain"
+	"github.com/RedPaladin7/peerpoker/internal/crypto"
 	"github.com/RedPaladin7/peerpoker/internal/deck"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/sirupsen/logrus"
@@ -49,27 +50,22 @@ func (g *Game) ResolveWinner() {
 		return
 	}
 
-	// Multiple players - need to evaluate hands
+	// Multiple players - evaluate hands
 	playerHands := make([]PlayerHand, 0, len(nonFoldedPlayers))
 
 	for _, playerAddr := range nonFoldedPlayers {
-		state := g.playerStates[playerAddr]
-
-		// TODO: Decrypt player's hole cards using revealed keys
-		// For now, we'll use placeholder logic
-		playerHand := []deck.Card{
-			// These would be decrypted from the encrypted deck
-		}
+		// Decrypt player's hole cards using revealed keys
+		holeCards := g.decryptPlayerCards(playerAddr)
 
 		// Evaluate hand
-		rank, handName := deck.EvaluateBestHand(playerHand, g.communityCards)
+		rank, handName := deck.EvaluateBestHand(holeCards, g.communityCards)
 
 		logrus.Infof("Player %s: %v - %s (Rank: %d)",
-			playerAddr, playerHand, handName, rank)
+			playerAddr, holeCards, handName, rank)
 
 		playerHands = append(playerHands, PlayerHand{
 			Addr:     playerAddr,
-			Hand:     playerHand,
+			Hand:     holeCards,
 			Rank:     rank,
 			HandName: handName,
 		})
@@ -160,6 +156,45 @@ func (g *Game) ResolveWinner() {
 	g.resetHandState()
 }
 
+// decryptPlayerCards decrypts a player's hole cards using all revealed keys
+func (g *Game) decryptPlayerCards(playerAddr string) []deck.Card {
+	// Get player's card indices (first two cards for this player)
+	state := g.playerStates[playerAddr]
+	cardIndices := []int{state.RotationID * 2, state.RotationID*2 + 1}
+
+	cards := make([]deck.Card, 0, 2)
+
+	for _, idx := range cardIndices {
+		if idx >= len(g.currentDeck) {
+			logrus.Warnf("Card index %d out of bounds", idx)
+			continue
+		}
+
+		encryptedCard := g.currentDeck[idx]
+
+		// Decrypt using all revealed keys (from folded players and this player)
+		decryptedCard := encryptedCard
+
+		// Apply folded player keys
+		for _, keys := range g.foldedPlayerKeys {
+			decryptedCard = keys.Decrypt(decryptedCard)
+		}
+
+		// Apply revealed keys
+		for _, keys := range g.revealedKeys {
+			decryptedCard = keys.Decrypt(decryptedCard)
+		}
+
+		// Convert decrypted bytes to card
+		if len(decryptedCard) > 0 {
+			card := deck.NewCardFromByte(decryptedCard[0])
+			cards = append(cards, card)
+		}
+	}
+
+	return cards
+}
+
 // distributeWinningsOnChain sends payout transaction to smart contract
 func (g *Game) distributeWinningsOnChain(winners []string, amounts []int) {
 	winnerAddrs := make([]common.Address, len(winners))
@@ -190,12 +225,105 @@ func (g *Game) distributeWinningsOnChain(winners []string, amounts []int) {
 // InitiateShuffleAndDeal starts the mental poker protocol
 func (g *Game) InitiateShuffleAndDeal() {
 	logrus.Info("Initiating shuffle and deal protocol...")
-	// TODO: Implement mental poker shuffle and deal
-	// This would involve:
-	// 1. Creating encrypted deck
-	// 2. Each player shuffles and encrypts
-	// 3. Distribute encrypted cards
-	// 4. Players decrypt their own cards
+
+	// Step 1: Create initial deck
+	initialDeck := deck.NewDeck()
+	g.currentDeck = initialDeck.ToBytes()
+
+	logrus.Infof("Created initial deck with %d cards", len(g.currentDeck))
+
+	// Step 2: Encrypt deck with our keys
+	g.currentDeck = crypto.EncryptDeck(g.currentDeck, g.deckKeys)
+	logrus.Info("Encrypted deck with our keys")
+
+	// Step 3: Shuffle the deck
+	g.currentDeck = crypto.ShuffleDeck(g.currentDeck)
+	logrus.Info("Shuffled deck")
+
+	// Step 4: In a real P2P game, each player would:
+	// - Receive the deck
+	// - Encrypt with their keys
+	// - Shuffle
+	// - Pass to next player
+	// For now, we simulate this with multiple encryption rounds
+
+	activePlayers := g.getReadyActivePlayers()
+	for i, playerAddr := range activePlayers {
+		if playerAddr == g.listenAddr {
+			continue // Skip self, already encrypted
+		}
+
+		// Simulate other players encrypting (in real implementation, this happens via P2P)
+		logrus.Infof("Simulating encryption by player %d (%s)", i, playerAddr)
+		
+		// Generate temporary keys for this player (in reality, they would use their own)
+		tempKeys, _ := crypto.GenerateCardKeys()
+		g.currentDeck = crypto.EncryptDeck(g.currentDeck, tempKeys)
+		g.currentDeck = crypto.ShuffleDeck(g.currentDeck)
+		
+		// Store keys for later decryption
+		g.revealedKeys[playerAddr] = tempKeys
+	}
+
+	logrus.Infof("Deck fully encrypted and shuffled by %d players", len(activePlayers))
+
+	// Step 5: Deal cards (encrypt indices are known to all players)
+	g.dealHoleCards()
+	
+	// Update game status
+	g.setStatus(GameStatusPreFlop)
+	logrus.Info("Cards dealt, starting pre-flop betting")
+}
+
+// dealHoleCards deals 2 cards to each player
+func (g *Game) dealHoleCards() {
+	activePlayers := g.getReadyActivePlayers()
+	
+	for i, playerAddr := range activePlayers {
+		card1Idx := i * 2
+		card2Idx := i*2 + 1
+
+		logrus.Infof("Player %s assigned cards at indices [%d, %d]", playerAddr, card1Idx, card2Idx)
+
+		// If this is us, decrypt our cards
+		if playerAddr == g.listenAddr {
+			g.myHand = g.decryptPlayerCards(g.listenAddr)
+			logrus.Infof("Our hand: %v", g.myHand)
+		}
+	}
+
+	logrus.Info("Hole cards dealt to all players")
+}
+
+// dealCommunityCards deals community cards (flop, turn, or river)
+func (g *Game) dealCommunityCards(count int) {
+	numPlayers := len(g.getReadyActivePlayers())
+	startIdx := numPlayers*2 + len(g.communityCards)
+
+	for i := 0; i < count; i++ {
+		cardIdx := startIdx + i
+		if cardIdx >= len(g.currentDeck) {
+			logrus.Warnf("Not enough cards in deck for community card %d", i)
+			continue
+		}
+
+		encryptedCard := g.currentDeck[cardIdx]
+		decryptedCard := encryptedCard
+
+		// Decrypt using all player keys
+		for _, keys := range g.revealedKeys {
+			decryptedCard = keys.Decrypt(decryptedCard)
+		}
+
+		// Decrypt with our keys
+		decryptedCard = g.deckKeys.Decrypt(decryptedCard)
+
+		if len(decryptedCard) > 0 {
+			card := deck.NewCardFromByte(decryptedCard[0])
+			g.communityCards = append(g.communityCards, card)
+			logrus.Infof("Dealt community card: %s", card.String())
+		}
+	}
 }
 
 // resetHandState resets the game state for a new hand
@@ -228,8 +356,6 @@ func (g *Game) resetHandState() {
 	// Check if we have enough players
 	if len(g.getReadyActivePlayers()) >= 2 {
 		g.setStatus(GameStatusWaiting)
-		// Auto-start next hand after a delay if all players are still ready
-		// For now, we'll wait for ready signals again
 	} else {
 		g.setStatus(GameStatusWaiting)
 		logrus.Info("Not enough players, waiting for more")
