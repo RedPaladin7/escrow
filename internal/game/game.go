@@ -3,11 +3,15 @@ package game
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
+	"sort"
 	"sync"
 
+	"github.com/RedPaladin7/peerpoker/internal/blockchain"
 	"github.com/RedPaladin7/peerpoker/internal/crypto"
 	"github.com/RedPaladin7/peerpoker/internal/deck"
 	"github.com/RedPaladin7/peerpoker/internal/protocol"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/sirupsen/logrus"
 )
 
@@ -41,6 +45,11 @@ type Game struct {
 
 	// Side pots
 	sidePots []SidePot
+
+	// Blockchain integration
+	blockchain        *blockchain.BlockchainClient
+	blockchainGameID  [32]byte
+	blockchainEnabled bool
 }
 
 type BroadcastFunc func(data []byte, targets ...string)
@@ -51,21 +60,23 @@ type SidePot struct {
 	EligiblePlayers []string
 }
 
-func NewGame(addr string, broadcast BroadcastFunc) *Game {
+func NewGame(addr string, broadcast BroadcastFunc, bc *blockchain.BlockchainClient) *Game {
 	keys, _ := crypto.GenerateCardKeys()
 
 	g := &Game{
-		listenAddr:       addr,
-		broadcastFunc:    broadcast,
-		playerStates:     make(map[string]*PlayerState),
-		rotationMap:      make(map[int]string),
-		currentStatus:    GameStatusWaiting,
-		deckKeys:         keys,
-		foldedPlayerKeys: make(map[string]*crypto.CardKeys),
-		revealedKeys:     make(map[string]*crypto.CardKeys),
-		myHand:           make([]deck.Card, 0, 2),
-		communityCards:   make([]deck.Card, 0, 5),
-		sidePots:         []SidePot{},
+		listenAddr:        addr,
+		broadcastFunc:     broadcast,
+		playerStates:      make(map[string]*PlayerState),
+		rotationMap:       make(map[int]string),
+		currentStatus:     GameStatusWaiting,
+		deckKeys:          keys,
+		foldedPlayerKeys:  make(map[string]*crypto.CardKeys),
+		revealedKeys:      make(map[string]*crypto.CardKeys),
+		myHand:            make([]deck.Card, 0, 2),
+		communityCards:    make([]deck.Card, 0, 5),
+		sidePots:          []SidePot{},
+		blockchain:        bc,
+		blockchainEnabled: bc != nil,
 	}
 
 	go g.loop()
@@ -346,5 +357,181 @@ func (g *Game) advanceDealer() {
 		if startID == g.currentDealerID {
 			break
 		}
+	}
+}
+
+// StartNewHand starts a new poker hand
+func (g *Game) StartNewHand() {
+	activeReadyPlayers := g.getReadyActivePlayers()
+	if len(activeReadyPlayers) < 2 {
+		g.setStatus(GameStatusWaiting)
+		logrus.Warn("Not enough players to start a hand")
+		return
+	}
+
+	// Blockchain: Create game on-chain
+	if g.blockchainEnabled && g.blockchainGameID == [32]byte{} {
+		buyIn := big.NewInt(int64(1000)) // Default 1000 wei buy-in
+		smallBlind := big.NewInt(int64(SmallBlind))
+		bigBlind := big.NewInt(int64(BigBlind))
+
+		gameID, err := g.blockchain.CreateGame(buyIn, smallBlind, bigBlind, uint8(len(activeReadyPlayers)))
+		if err != nil {
+			logrus.Errorf("Failed to create game on blockchain: %v", err)
+			// Continue without blockchain if it fails
+		} else {
+			g.blockchainGameID = gameID
+			logrus.WithField("game_id", fmt.Sprintf("0x%x", gameID)).Info("Blockchain game created")
+		}
+	}
+
+	// Blockchain: Verify all players have locked buy-ins
+	if g.blockchainEnabled && g.blockchainGameID != [32]byte{} {
+		allVerified := true
+		for _, playerAddr := range activeReadyPlayers {
+			addr := common.HexToAddress(playerAddr)
+			verified, err := g.blockchain.VerifyBuyIn(g.blockchainGameID, addr)
+			if err != nil || !verified {
+				logrus.Warnf("Player %s buy-in not verified: %v", playerAddr, err)
+				allVerified = false
+			}
+		}
+
+		if !allVerified {
+			logrus.Warn("Not all players have verified buy-ins, but continuing game...")
+			// In production, you might want to reject game start here
+		}
+	}
+
+	logrus.Info("=== Starting new hand ===")
+
+	// Reset state
+	g.rotationMap = make(map[int]string)
+	g.nextRotationID = 0
+	g.myHand = make([]deck.Card, 0, 2)
+	g.communityCards = make([]deck.Card, 0, 5)
+	g.lastRaiseAmount = BigBlind
+	g.currentPot = 0
+	g.highestBet = 0
+	g.sidePots = []SidePot{}
+	g.revealedKeys = make(map[string]*crypto.CardKeys)
+	g.foldedPlayerKeys = make(map[string]*crypto.CardKeys)
+
+	// Assign rotation IDs
+	sort.Strings(activeReadyPlayers)
+	for _, addr := range activeReadyPlayers {
+		state := g.playerStates[addr]
+		state.RotationID = g.nextRotationID
+		state.IsFolded = false
+		state.CurrentRoundBet = 0
+		state.TotalBetThisHand = 0
+		state.IsAllIn = false
+		g.rotationMap[state.RotationID] = addr
+		g.nextRotationID++
+	}
+
+	// Advance dealer
+	g.advanceDealer()
+
+	// Post blinds
+	g.postBlinds()
+
+	// Blockchain: Start game on-chain
+	if g.blockchainEnabled && g.blockchainGameID != [32]byte{} {
+		err := g.blockchain.StartGame(g.blockchainGameID)
+		if err != nil {
+			logrus.Errorf("Failed to start game on blockchain: %v", err)
+		} else {
+			logrus.Info("Game started on blockchain")
+		}
+	}
+
+	// Set status
+	g.setStatus(GameStatusDealing)
+
+	// Start shuffle and deal
+	g.InitiateShuffleAndDeal()
+}
+
+// Post blinds
+func (g *Game) postBlinds() {
+	activeCount := len(g.getReadyActivePlayers())
+
+	if activeCount == 2 {
+		// Heads-up: dealer posts small blind
+		sbID := g.currentDealerID
+		sbAddr := g.rotationMap[sbID]
+		g.updatePlayerState(sbAddr, PlayerActionBet, SmallBlind)
+		logrus.Infof("Player %s (dealer) posted small blind: %d", sbAddr, SmallBlind)
+
+		bbID := g.getNextPlayerID(sbID)
+		bbAddr := g.rotationMap[bbID]
+		g.updatePlayerState(bbAddr, PlayerActionBet, BigBlind)
+		logrus.Infof("Player %s posted big blind: %d", bbAddr, BigBlind)
+
+		g.currentPlayerTurn = sbID
+		g.lastRaiserID = bbID
+	} else {
+		// Multi-way: small blind is left of dealer
+		sbID := g.getNextActivePlayerID(g.currentDealerID)
+		sbAddr := g.rotationMap[sbID]
+		g.updatePlayerState(sbAddr, PlayerActionBet, SmallBlind)
+		logrus.Infof("Player %s posted small blind: %d", sbAddr, SmallBlind)
+
+		bbID := g.getNextActivePlayerID(sbID)
+		bbAddr := g.rotationMap[bbID]
+		g.updatePlayerState(bbAddr, PlayerActionBet, BigBlind)
+		logrus.Infof("Player %s posted big blind: %d", bbAddr, BigBlind)
+
+		g.currentPlayerTurn = g.getNextActivePlayerID(bbID)
+		g.lastRaiserID = bbID
+	}
+
+	g.lastRaiseAmount = BigBlind
+}
+
+// Update player state based on action
+func (g *Game) updatePlayerState(addr string, action PlayerAction, value int) {
+	state := g.playerStates[addr]
+
+	switch action {
+	case PlayerActionFold:
+		state.IsFolded = true
+
+	case PlayerActionBet, PlayerActionRaise:
+		actualBet := value
+		if actualBet > state.Stack {
+			actualBet = state.Stack
+			state.IsAllIn = true
+			logrus.Infof("Player %s is ALL-IN!", addr)
+		}
+
+		amountToAdd := actualBet - state.CurrentRoundBet
+		state.CurrentRoundBet = actualBet
+		state.TotalBetThisHand += amountToAdd
+		g.currentPot += amountToAdd
+		state.Stack -= amountToAdd
+
+		if state.CurrentRoundBet > g.highestBet {
+			g.highestBet = state.CurrentRoundBet
+			g.lastRaiserID = state.RotationID
+		}
+
+	case PlayerActionCall:
+		amountNeeded := g.highestBet - state.CurrentRoundBet
+		actualCall := amountNeeded
+		if actualCall > state.Stack {
+			actualCall = state.Stack
+			state.IsAllIn = true
+			logrus.Infof("Player %s is ALL-IN!", addr)
+		}
+
+		state.CurrentRoundBet += actualCall
+		state.TotalBetThisHand += actualCall
+		g.currentPot += actualCall
+		state.Stack -= actualCall
+
+	case PlayerActionCheck:
+		// No state change
 	}
 }
