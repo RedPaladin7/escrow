@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -47,25 +48,24 @@ func (bc *BlockchainClient) CreateGame(buyIn, smallBlind, bigBlind *big.Int, max
 	// Call contract (will work once bindings are generated)
 	// tx, err := bc.pokerTable.CreateGame(auth, buyIn, smallBlind, bigBlind, big.NewInt(int64(maxPlayers)))
 	// if err != nil {
-	// 	return gameID, fmt.Errorf("failed to create game: %w", err)
+	//     return gameID, fmt.Errorf("failed to create game: %w", err)
 	// }
 	//
 	// receipt, err := bind.WaitMined(context.Background(), bc.client, tx)
 	// if err != nil {
-	// 	return gameID, fmt.Errorf("transaction failed: %w", err)
+	//     return gameID, fmt.Errorf("transaction failed: %w", err)
 	// }
 	//
 	// // Parse GameCreated event
 	// for _, log := range receipt.Logs {
-	// 	event, err := bc.pokerTable.ParseGameCreated(*log)
-	// 	if err == nil {
-	// 		logrus.WithField("game_id", fmt.Sprintf("0x%x", event.GameId)).Info("Game created successfully")
-	// 		return event.GameId, nil
-	// 	}
+	//     event, err := bc.pokerTable.ParseGameCreated(*log)
+	//     if err == nil {
+	//         logrus.WithField("game_id", fmt.Sprintf("0x%x", event.GameId)).Info("Game created successfully")
+	//         return event.GameId, nil
+	//     }
 	// }
 
 	logrus.Info("CreateGame called (bindings not generated yet)")
-	
 	// Return mock game ID for testing without blockchain
 	gameID = GenerateGameID(bc.publicAddress, int64(1), buyIn)
 	return gameID, nil
@@ -88,12 +88,12 @@ func (bc *BlockchainClient) JoinGame(gameID [32]byte, buyInAmount *big.Int) erro
 	// Call contract (will work once bindings are generated)
 	// tx, err := bc.pokerTable.JoinGame(auth, gameID)
 	// if err != nil {
-	// 	return fmt.Errorf("failed to join game: %w", err)
+	//     return fmt.Errorf("failed to join game: %w", err)
 	// }
 	//
 	// _, err = bind.WaitMined(context.Background(), bc.client, tx)
 	// if err != nil {
-	// 	return fmt.Errorf("transaction failed: %w", err)
+	//     return fmt.Errorf("transaction failed: %w", err)
 	// }
 	//
 	// logrus.Info("Joined game successfully")
@@ -114,12 +114,11 @@ func (bc *BlockchainClient) VerifyBuyIn(gameID [32]byte, playerAddr common.Addre
 	// Call contract (will work once bindings are generated)
 	// isInGame, err := bc.pokerTable.IsPlayerInGame(callOpts, gameID, playerAddr)
 	// if err != nil {
-	// 	return false, fmt.Errorf("failed to verify buy-in: %w", err)
+	//     return false, fmt.Errorf("failed to verify buy-in: %w", err)
 	// }
 	// return isInGame, nil
 
 	_ = callOpts // Suppress unused variable warning
-	
 	logrus.Debug("VerifyBuyIn called (bindings not generated yet)")
 	return true, nil // Placeholder - allows game to proceed without blockchain
 }
@@ -138,18 +137,17 @@ func (bc *BlockchainClient) StartGame(gameID [32]byte) error {
 	// Call contract (will work once bindings are generated)
 	// tx, err := bc.pokerTable.StartGame(auth, gameID)
 	// if err != nil {
-	// 	return fmt.Errorf("failed to start game: %w", err)
+	//     return fmt.Errorf("failed to start game: %w", err)
 	// }
 	//
 	// _, err = bind.WaitMined(context.Background(), bc.client, tx)
 	// if err != nil {
-	// 	return fmt.Errorf("transaction failed: %w", err)
+	//     return fmt.Errorf("transaction failed: %w", err)
 	// }
 	//
 	// logrus.Info("Game started successfully")
 
 	_ = auth // Suppress unused variable warning
-	
 	logrus.Info("StartGame called (bindings not generated yet)")
 	return nil
 }
@@ -174,19 +172,98 @@ func (bc *BlockchainClient) EndGame(gameID [32]byte, winners []common.Address, a
 	// Call contract (will work once bindings are generated)
 	// tx, err := bc.pokerTable.EndGame(auth, gameID, winners, amounts)
 	// if err != nil {
-	// 	return fmt.Errorf("failed to end game: %w", err)
+	//     return fmt.Errorf("failed to end game: %w", err)
 	// }
 	//
 	// receipt, err := bind.WaitMined(context.Background(), bc.client, tx)
 	// if err != nil {
-	// 	return fmt.Errorf("transaction failed: %w", err)
+	//     return fmt.Errorf("transaction failed: %w", err)
 	// }
 	//
 	// logrus.WithField("tx_hash", receipt.TxHash.Hex()).Info("Game ended successfully")
 
 	_ = auth // Suppress unused variable warning
-	
 	logrus.Info("EndGame called (bindings not generated yet)")
+	return nil
+}
+
+// NEW: EndGameWithPenalty ends game with penalty applied to abandoned player
+func (bc *BlockchainClient) EndGameWithPenalty(
+	gameID string,
+	abandonedPlayer common.Address,
+	winners []common.Address,
+	amounts []*big.Int,
+) error {
+	logrus.WithFields(logrus.Fields{
+		"game_id":          gameID,
+		"abandoned_player": abandonedPlayer.Hex(),
+		"winners":          len(winners),
+		"total_payout":     sumAmounts(amounts).String(),
+	}).Info("💀 Ending game with penalty on blockchain")
+
+	// Validate inputs
+	if len(winners) != len(amounts) {
+		return fmt.Errorf("winners and amounts length mismatch")
+	}
+
+	if len(winners) == 0 {
+		return fmt.Errorf("no winners specified")
+	}
+
+	// Convert gameID string to [32]byte
+	var gameIDBytes [32]byte
+	gameIDHex := common.HexToHash(gameID)
+	copy(gameIDBytes[:], gameIDHex[:])
+
+	auth, err := bc.GetTransactor()
+	if err != nil {
+		return fmt.Errorf("failed to get transactor: %w", err)
+	}
+
+	// Log penalty details
+	logrus.Info("📝 Penalty transaction details:")
+	logrus.Infof("  - Game ID: %s", gameID)
+	logrus.Infof("  - Abandoned Player: %s", abandonedPlayer.Hex())
+	logrus.Infof("  - Number of Winners: %d", len(winners))
+
+	totalPayout := big.NewInt(0)
+	for i, winner := range winners {
+		logrus.Infof("    Winner %d: %s -> %s wei", i+1, winner.Hex(), amounts[i].String())
+		totalPayout.Add(totalPayout, amounts[i])
+	}
+	logrus.Infof("  - Total Payout: %s wei", totalPayout.String())
+
+	// Call contract (will work once bindings are generated)
+	// tx, err := bc.pokerTable.EndGameWithPenalty(auth, gameIDBytes, abandonedPlayer, winners, amounts)
+	// if err != nil {
+	//     return fmt.Errorf("failed to call endGameWithPenalty: %w", err)
+	// }
+	//
+	// logrus.WithField("tx_hash", tx.Hash().Hex()).Info("Transaction submitted, waiting for confirmation...")
+	//
+	// ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// defer cancel()
+	//
+	// receipt, err := bind.WaitMined(ctx, bc.client, tx)
+	// if err != nil {
+	//     return fmt.Errorf("transaction failed: %w", err)
+	// }
+	//
+	// if receipt.Status != 1 {
+	//     return fmt.Errorf("transaction reverted")
+	// }
+	//
+	// logrus.WithFields(logrus.Fields{
+	//     "tx_hash":  receipt.TxHash.Hex(),
+	//     "gas_used": receipt.GasUsed,
+	//     "block":    receipt.BlockNumber.Uint64(),
+	// }).Info("✅ Penalty transaction confirmed")
+
+	// Simulate blockchain delay for testing
+	_ = auth // Suppress unused variable warning
+	time.Sleep(1 * time.Second)
+	logrus.Info("✅ EndGameWithPenalty called (bindings not generated yet)")
+
 	return nil
 }
 
@@ -197,24 +274,23 @@ func (bc *BlockchainClient) GetGameInfo(gameID [32]byte) (*GameInfo, error) {
 	// Call contract (will work once bindings are generated)
 	// result, err := bc.pokerTable.GetGame(callOpts, gameID)
 	// if err != nil {
-	// 	return nil, fmt.Errorf("failed to get game info: %w", err)
+	//     return nil, fmt.Errorf("failed to get game info: %w", err)
 	// }
 	//
 	// return &GameInfo{
-	// 	Creator:     result.Creator,
-	// 	BuyIn:       result.BuyIn,
-	// 	SmallBlind:  result.SmallBlind,
-	// 	BigBlind:    result.BigBlind,
-	// 	MaxPlayers:  result.MaxPlayers,
-	// 	TotalPot:    result.TotalPot,
-	// 	PlayerCount: result.PlayerCount,
-	// 	Status:      result.Status,
+	//     Creator:     result.Creator,
+	//     BuyIn:       result.BuyIn,
+	//     SmallBlind:  result.SmallBlind,
+	//     BigBlind:    result.BigBlind,
+	//     MaxPlayers:  result.MaxPlayers,
+	//     TotalPot:    result.TotalPot,
+	//     PlayerCount: result.PlayerCount,
+	//     Status:      result.Status,
 	// }, nil
 
 	_ = callOpts // Suppress unused variable warning
-	
 	logrus.Debug("GetGameInfo called (bindings not generated yet)")
-	
+
 	// Return mock data for testing
 	return &GameInfo{
 		Creator:     bc.publicAddress,
@@ -228,6 +304,7 @@ func (bc *BlockchainClient) GetGameInfo(gameID [32]byte) (*GameInfo, error) {
 	}, nil
 }
 
+// Helper function to sum amounts
 func sumAmounts(amounts []*big.Int) *big.Int {
 	total := big.NewInt(0)
 	for _, amount := range amounts {
